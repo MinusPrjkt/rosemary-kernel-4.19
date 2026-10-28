@@ -1974,8 +1974,6 @@ static void bbr_main(struct sock *sk, const struct rate_sample *rs)
 		bbr->rounds_since_probe =
 			min_t(s32, bbr->rounds_since_probe + 1, 0xFF);
 		ctx.ce_ratio = bbr_update_ecn_alpha(sk);
-		bbr->round_losses = 0;
-		bbr->round_max_inflight = 0;
 	}
 	bbr_calculate_bw_sample(sk, rs, &ctx);
 	bbr_update_latest_delivery_signals(sk, rs, &ctx);
@@ -1998,6 +1996,10 @@ out:
 	bbr_advance_latest_delivery_signals(sk, rs, &ctx);
 	bbr->prev_ca_state = inet_csk(sk)->icsk_ca_state;
 	bbr->loss_in_cycle |= rs->losses > 0;
+	if (bbr->loss_round_start) {
+		bbr->round_losses = 0;
+		bbr->round_max_inflight = 0;
+	}
 }
 
 static void bbr_init(struct sock *sk)
