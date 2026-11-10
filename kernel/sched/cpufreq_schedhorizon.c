@@ -117,7 +117,7 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 {
 	struct sugov_tunables *tunables = sg_policy->tunables;
 	unsigned long flags;
-	int step, neff, ndelay;
+	int step, max_steps;
 
 	/*
 	 * do_freq_limit() runs from cpufreq_update_util() with IRQs
@@ -125,50 +125,62 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 	 */
 	raw_spin_lock_irqsave(&tunables->change_lock, flags);
 
+	max_steps = min(tunables->nefficient_freq, tunables->nup_delay);
+	if (unlikely(max_steps <= 0))
+		goto out;
+
 	step = sg_policy->current_step;
-	neff = tunables->nefficient_freq;
-	ndelay = tunables->nup_delay;
-
-	if (step < 0 || step >= neff || step >= ndelay) {
-		/* Self-heal: index out of range for one of the arrays. */
+	if (unlikely(step < 0 || step >= max_steps)) {
+		/* Self-heal: index out of range for active step table. */
 		sg_policy->current_step = 0;
-		goto out;
-	}
-
-	if (*freq > tunables->efficient_freq[step] &&
-	    !sg_policy->first_hp_request_time) {
-		/* First request: pin to the current step's efficient freq. */
-		*freq = tunables->efficient_freq[step];
-		sg_policy->first_hp_request_time = time;
-		goto out;
+		sg_policy->first_hp_request_time = 0;
+		step = 0;
 	}
 
 	if (*freq < tunables->efficient_freq[step]) {
-		/* Already below current step: drop to the nearest lower one. */
-		step = match_nearest_efficient_step(*freq, neff,
+		/* Below current step: drop to the nearest lower efficient step. */
+		step = match_nearest_efficient_step(*freq, max_steps,
 						    tunables->efficient_freq);
-		if (step < neff) {
-			sg_policy->current_step = step;
-			sg_policy->first_hp_request_time = 0;
-		}
+		sg_policy->current_step = step;
+		sg_policy->first_hp_request_time = 0;
 		goto out;
 	}
 
-	if (sg_policy->first_hp_request_time &&
-	    time < sg_policy->first_hp_request_time + tunables->up_delay[step]) {
-		/* Still within the dwell time: hold at current step. */
+	if (*freq == tunables->efficient_freq[step]) {
+		/*
+		 * Exactly at current step ceiling: no longer requesting a
+		 * higher step, so clear any pending dwell timer.
+		 */
+		sg_policy->first_hp_request_time = 0;
+		goto out;
+	}
+
+	/* Here, *freq > tunables->efficient_freq[step] */
+	if (!sg_policy->first_hp_request_time) {
+		/* First request above ceiling: pin, start dwell timer. */
+		*freq = tunables->efficient_freq[step];
+		sg_policy->first_hp_request_time = time;
+		goto out;
+	}
+
+	if (time < sg_policy->first_hp_request_time + tunables->up_delay[step]) {
+		/* Still within dwell time: hold at current step. */
 		*freq = tunables->efficient_freq[step];
 		goto out;
 	}
 
-	if (step + 1 < neff && step + 1 < ndelay) {
-		/* Dwell time elapsed: unlock the next step. */
-		sg_policy->current_step++;
-		sg_policy->first_hp_request_time = time;
-		if (*freq > tunables->efficient_freq[sg_policy->current_step])
-			*freq = tunables->efficient_freq[sg_policy->current_step];
+	/* Dwell time elapsed: unlock next step if available. */
+	if (step + 1 < max_steps) {
+		step++;
+		sg_policy->current_step = step;
+		if (*freq > tunables->efficient_freq[step]) {
+			*freq = tunables->efficient_freq[step];
+			sg_policy->first_hp_request_time = time;
+		} else {
+			sg_policy->first_hp_request_time = 0;
+		}
 	}
-	/* else: at the top step, freq is passed through unchanged. */
+	/* else: at the top step, *freq is passed through uncapped. */
 
 out:
 	raw_spin_unlock_irqrestore(&tunables->change_lock, flags);
@@ -315,7 +327,12 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 
 	h_freq = policy->freq_table[idx].frequency;
 	h_freq = clamp(h_freq, policy->min, policy->max);
-	if (l_freq <= h_freq || l_freq == policy->min)
+	/*
+	 * Guard against freq <= h_freq (which happens when freq is below
+	 * the lowest frequency table entry) to prevent unsigned underflow
+	 * in (freq - h_freq) below.
+	 */
+	if (freq <= h_freq || l_freq <= h_freq || l_freq == policy->min)
 		return l_freq;
 
 	/*
@@ -608,17 +625,17 @@ static unsigned int *resolve_data_freq(const char *buf, int *num_ret, size_t cou
 	if (!count)
 		return NULL;
 
-	str = kmemdup(buf, count + 1, GFP_KERNEL);
+	str = kmemdup_nul(buf, count, GFP_KERNEL);
 	if (!str)
 		return NULL;
-	str[count] = '\0';
 
 	/*
-	 * Worst case: every byte is a separate one-character token, so
-	 * count + 1 is a safe upper bound.  strsep() replaces delimiters
-	 * with NULs, so it is used only once, on this private copy.
+	 * The parse loop below rejects more than SCHEDHORIZON_MAX_STEPS
+	 * tokens, so the step cap is a safe allocation bound.  strsep()
+	 * replaces delimiters with NULs, so it is used only once, on
+	 * this private copy.
 	 */
-	output = kmalloc_array(count + 1, sizeof(*output), GFP_KERNEL);
+	output = kmalloc_array(SCHEDHORIZON_MAX_STEPS, sizeof(*output), GFP_KERNEL);
 	if (!output)
 		goto err_free_str;
 
@@ -659,12 +676,17 @@ static u64 *resolve_data_delay(const char *buf, int *num_ret, size_t count)
 	if (!count)
 		return NULL;
 
-	str = kmemdup(buf, count + 1, GFP_KERNEL);
+	str = kmemdup_nul(buf, count, GFP_KERNEL);
 	if (!str)
 		return NULL;
-	str[count] = '\0';
 
-	output = kmalloc_array(count + 1, sizeof(*output), GFP_KERNEL);
+	/*
+	 * The parse loop below rejects more than SCHEDHORIZON_MAX_STEPS
+	 * tokens, so the step cap is a safe allocation bound.  strsep()
+	 * replaces delimiters with NULs, so it is used only once, on
+	 * this private copy.
+	 */
+	output = kmalloc_array(SCHEDHORIZON_MAX_STEPS, sizeof(*output), GFP_KERNEL);
 	if (!output)
 		goto err_free_str;
 
@@ -733,7 +755,7 @@ up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t co
 	tunables->up_rate_limit_us = rate_limit_us;
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
-		sg_policy->up_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;
+		sg_policy->up_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;
 
 	return count;
 }
@@ -751,7 +773,7 @@ down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t 
 	tunables->down_rate_limit_us = rate_limit_us;
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
-		sg_policy->down_rate_delay_ns = rate_limit_us * NSEC_PER_USEC;
+		sg_policy->down_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;
 
 	return count;
 }
@@ -825,8 +847,10 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 	old = tunables->efficient_freq;
 	tunables->efficient_freq = new_efficient_freq;
 	tunables->nefficient_freq = new_num;
-	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sg_policy->current_step = 0;
+		sg_policy->first_hp_request_time = 0;
+	}
 	raw_spin_unlock_irqrestore(&tunables->change_lock, flags);
 
 	/*
@@ -868,8 +892,10 @@ static ssize_t up_delay_store(struct gov_attr_set *attr_set,
 	old = tunables->up_delay;
 	tunables->up_delay = new_up_delay;
 	tunables->nup_delay = new_num;
-	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sg_policy->current_step = 0;
+		sg_policy->first_hp_request_time = 0;
+	}
 	raw_spin_unlock_irqrestore(&tunables->change_lock, flags);
 
 	if (old != default_up_delay)
@@ -1121,8 +1147,8 @@ static int sugov_start(struct cpufreq_policy *policy)
 	struct sugov_policy *sg_policy = policy->governor_data;
 	unsigned int cpu;
 
-	sg_policy->up_rate_delay_ns	= sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
-	sg_policy->down_rate_delay_ns	= sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
+	sg_policy->up_rate_delay_ns	= (s64)sg_policy->tunables->up_rate_limit_us * NSEC_PER_USEC;
+	sg_policy->down_rate_delay_ns	= (s64)sg_policy->tunables->down_rate_limit_us * NSEC_PER_USEC;
 	sg_policy->last_freq_update_time	= 0;
 	sg_policy->next_freq			= 0;
 	sg_policy->work_in_progress		= false;
