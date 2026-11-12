@@ -105,7 +105,7 @@ static inline int match_nearest_efficient_step(unsigned int freq, int maxstep,
 			break;
 	}
 
-	/* Callers must treat maxstep as "no match"; clamp to a safe index. */
+	/* Clamp to the highest valid step when freq exceeds all entries. */
 	if (i == maxstep)
 		i = maxstep - 1;
 
@@ -118,6 +118,10 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 	struct sugov_tunables *tunables = sg_policy->tunables;
 	unsigned long flags;
 	int step, max_steps;
+
+	/* Skip locking on the hot path when using the uncapped default table. */
+	if (READ_ONCE(tunables->efficient_freq) == default_efficient_freq)
+		return;
 
 	/*
 	 * do_freq_limit() runs from cpufreq_update_util() with IRQs
@@ -137,8 +141,8 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 		step = 0;
 	}
 
-	if (*freq < tunables->efficient_freq[step]) {
-		/* Below current step: drop to the nearest lower efficient step. */
+	if (step > 0 && *freq <= tunables->efficient_freq[step - 1]) {
+		/* Dropped below lower step ceiling: step down immediately. */
 		step = match_nearest_efficient_step(*freq, max_steps,
 						    tunables->efficient_freq);
 		sg_policy->current_step = step;
@@ -146,11 +150,8 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 		goto out;
 	}
 
-	if (*freq == tunables->efficient_freq[step]) {
-		/*
-		 * Exactly at current step ceiling: no longer requesting a
-		 * higher step, so clear any pending dwell timer.
-		 */
+	if (*freq <= tunables->efficient_freq[step]) {
+		/* Within current step band: preserve step, clear dwell timer. */
 		sg_policy->first_hp_request_time = 0;
 		goto out;
 	}
@@ -208,8 +209,8 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 		return false;
 
-	if (unlikely(sg_policy->limits_changed)) {
-		sg_policy->limits_changed = false;
+	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
+		WRITE_ONCE(sg_policy->limits_changed, false);
 		sg_policy->need_freq_update = true;
 	}
 
@@ -233,8 +234,8 @@ static bool sugov_within_rate_limit(struct sugov_policy *sg_policy, u64 time,
 	delta_ns = time - sg_policy->last_freq_update_time;
 
 	delay_ns = (next_freq >= sg_policy->next_freq) ?
-			sg_policy->up_rate_delay_ns :
-			sg_policy->down_rate_delay_ns;
+			READ_ONCE(sg_policy->up_rate_delay_ns) :
+			READ_ONCE(sg_policy->down_rate_delay_ns);
 
 	return delta_ns >= delay_ns;
 }
@@ -484,7 +485,7 @@ static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
 static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu, struct sugov_policy *sg_policy)
 {
 	if (cpu_bw_dl(cpu_rq(sg_cpu->cpu)) > sg_cpu->bw_dl)
-		sg_policy->limits_changed = true;
+		WRITE_ONCE(sg_policy->limits_changed, true);
 }
 
 static void sugov_update_single(struct update_util_data *hook, u64 time,
@@ -755,7 +756,8 @@ up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t co
 	tunables->up_rate_limit_us = rate_limit_us;
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
-		sg_policy->up_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;
+		WRITE_ONCE(sg_policy->up_rate_delay_ns,
+			   (s64)rate_limit_us * NSEC_PER_USEC);
 
 	return count;
 }
@@ -773,7 +775,8 @@ down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t 
 	tunables->down_rate_limit_us = rate_limit_us;
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
-		sg_policy->down_rate_delay_ns = (s64)rate_limit_us * NSEC_PER_USEC;
+		WRITE_ONCE(sg_policy->down_rate_delay_ns,
+			   (s64)rate_limit_us * NSEC_PER_USEC);
 
 	return count;
 }
@@ -845,7 +848,7 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 
 	raw_spin_lock_irqsave(&tunables->change_lock, flags);
 	old = tunables->efficient_freq;
-	tunables->efficient_freq = new_efficient_freq;
+	WRITE_ONCE(tunables->efficient_freq, new_efficient_freq);
 	tunables->nefficient_freq = new_num;
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sg_policy->current_step = 0;
@@ -1204,7 +1207,7 @@ static void sugov_limits(struct cpufreq_policy *policy)
 		mutex_unlock(&sg_policy->work_lock);
 	}
 
-	sg_policy->limits_changed = true;
+	WRITE_ONCE(sg_policy->limits_changed, true);
 }
 
 struct cpufreq_governor schedhorizon_gov = {
