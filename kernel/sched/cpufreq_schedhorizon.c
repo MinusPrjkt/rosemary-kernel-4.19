@@ -209,10 +209,14 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 		return false;
 
-	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
-		WRITE_ONCE(sg_policy->limits_changed, false);
+	/*
+	 * xchg() is a fully ordered test-and-clear: it pairs with the
+	 * smp_store_release() in sugov_limits() and cannot lose a
+	 * concurrent update.
+	 */
+	if (unlikely(READ_ONCE(sg_policy->limits_changed)) &&
+	    xchg(&sg_policy->limits_changed, false))
 		sg_policy->need_freq_update = true;
-	}
 
 	return true;
 }
@@ -1207,7 +1211,8 @@ static void sugov_limits(struct cpufreq_policy *policy)
 		mutex_unlock(&sg_policy->work_lock);
 	}
 
-	WRITE_ONCE(sg_policy->limits_changed, true);
+	/* Publish the new policy limits before raising the flag. */
+	smp_store_release(&sg_policy->limits_changed, true);
 }
 
 struct cpufreq_governor schedhorizon_gov = {
