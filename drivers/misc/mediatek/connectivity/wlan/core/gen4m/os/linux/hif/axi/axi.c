@@ -451,7 +451,16 @@ static int axiDmaSetup(struct platform_device *pdev,
 	if (ret)
 		goto exit;
 	ret = of_reserved_mem_device_init(&pdev->dev);
-	if (ret) {
+	if (ret == -EBUSY) {
+		/*
+		 * of_platform_device_create_pdata() already assigned the coherent
+		 * pool when the device was created, so this call returns -EBUSY.
+		 * cip137 started propagating that -EBUSY out of rmem_dma_device_init()
+		 * instead of swallowing it; the already-assigned pool is the state
+		 * this driver has always run with, so carry on.
+		 */
+		ret = 0;
+	} else if (ret) {
 		DBGLOG(INIT, ERROR, "of_reserved_mem_device_init failed(%d).\n",
 				ret);
 		goto exit;
