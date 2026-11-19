@@ -762,7 +762,7 @@ static void *__remove_wrapper_from_managed_res_list(
 				if (prev)
 					prev->next = mres->next;
 				else
-					tcp_dev->mr_head = NULL;
+					tcp_dev->mr_head = mres->next;
 				devm_kfree(&tcp_dev->dev, mres);
 				break;
 			}
