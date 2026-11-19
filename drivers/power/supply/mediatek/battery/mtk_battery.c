@@ -3256,7 +3256,8 @@ void exec_BAT_EC(int cmd, int param)
 		break;
 	case 717:
 		{
-			fg_table_cust_data.active_table_number = param;
+			if (param >= 1 && param <= MAX_TABLE)
+				fg_table_cust_data.active_table_number = param;
 			bm_err(
 				"exe_BAT_EC cmd %d, param %d, additional_battery_table_en\n",
 				cmd, param);
