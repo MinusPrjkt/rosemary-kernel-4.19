@@ -1005,6 +1005,7 @@ static int mt6360_set_cv(struct charger_device *chg_dev, u32 uV)
 	struct mt6360_pmu_chg_info *mpci = charger_get_data(chg_dev);
 	u8 data = 0;
 	u32 reg_data = 0;
+	int reg_ret = 0;
 	int ret = 0;
 
 	dev_dbg(mpci->dev, "%s: cv = %d\n", __func__, uV);
@@ -1016,9 +1017,12 @@ static int mt6360_set_cv(struct charger_device *chg_dev, u32 uV)
 	if (ret < 0)
 		return ret;
 
-	reg_data = mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_CHG_HIDDEN_CTRL22);
-	if (reg_data < 0)
+	reg_ret = mt6360_pmu_reg_read(mpci->mpi, MT6360_PMU_CHG_HIDDEN_CTRL22);
+	if (reg_ret < 0) {
+		ret = reg_ret;
 		goto out;
+	}
+	reg_data = reg_ret;
 	/* set reg0x45[6:5]=11 */
 	ret = mt6360_pmu_reg_set_bits(mpci->mpi, MT6360_PMU_CHG_HIDDEN_CTRL22,
 				      MT6360_MASK_BATOVP_LVL);
