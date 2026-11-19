@@ -751,10 +751,11 @@ static void *__remove_wrapper_from_managed_res_list(
 	struct tcpc_device *tcp_dev, void *key, int prv_id)
 {
 	void *retval = NULL;
-	struct tcpc_managed_res *mres = tcp_dev->mr_head;
+	struct tcpc_managed_res *mres;
 	struct tcpc_managed_res *prev = NULL;
 
 	mutex_lock(&tcp_dev->mr_lock);
+	mres = tcp_dev->mr_head;
 	if (mres) {
 		while (mres) {
 			if (mres->key == key && mres->prv_id == prv_id) {
