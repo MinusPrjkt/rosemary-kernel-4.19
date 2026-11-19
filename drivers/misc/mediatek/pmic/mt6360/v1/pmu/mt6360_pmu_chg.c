@@ -1056,7 +1056,7 @@ static int mt6360_toggle_aicc(struct mt6360_pmu_chg_info *mpci)
 	}
 	/* aicc off */
 	data &= ~MT6360_MASK_RG_EN_AICC;
-	ret = i2c_smbus_read_i2c_block_data(mpci->mpi->i2c,
+	ret = i2c_smbus_write_i2c_block_data(mpci->mpi->i2c,
 					       MT6360_PMU_CHG_CTRL14, 1, &data);
 	if (ret < 0) {
 		dev_err(mpci->dev, "%s: aicc off fail\n", __func__);
@@ -1064,7 +1064,7 @@ static int mt6360_toggle_aicc(struct mt6360_pmu_chg_info *mpci)
 	}
 	/* aicc on */
 	data |= MT6360_MASK_RG_EN_AICC;
-	ret = i2c_smbus_read_i2c_block_data(mpci->mpi->i2c,
+	ret = i2c_smbus_write_i2c_block_data(mpci->mpi->i2c,
 					       MT6360_PMU_CHG_CTRL14, 1, &data);
 	if (ret < 0)
 		dev_err(mpci->dev, "%s: aicc on fail\n", __func__);
