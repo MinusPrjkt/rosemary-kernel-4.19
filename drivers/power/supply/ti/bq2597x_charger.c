@@ -1068,7 +1068,7 @@ static int bq2597x_set_adc_scanrate(struct bq2597x *bq, bool oneshot)
 	val <<= BQ2597X_ADC_RATE_SHIFT;
 
 	ret = bq2597x_update_bits(bq, BQ2597X_REG_14,
-				BQ2597X_ADC_EN_MASK, val);
+				BQ2597X_ADC_RATE_MASK, val);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(bq2597x_set_adc_scanrate);
