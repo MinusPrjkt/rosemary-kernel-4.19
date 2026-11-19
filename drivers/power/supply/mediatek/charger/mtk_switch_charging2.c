@@ -309,9 +309,11 @@ static void swchg_select_charging_current_limit(struct charger_manager *info)
 			pr_info("QC set ICHG = 3000mA, AICR = 3000mA\n");
 		} else if (info->usb_type == POWER_SUPPLY_TYPE_USB_HVDCP
 			&& (swchgalg->vbus_mv > HVDCP2P0_VOLATGE)) {
-			pdata->charging_current_limit = 2400000;
-			pdata->input_current_limit = 1500000;
-			pr_info("QC2 set AICR = 1500mA\n");
+			pdata->charging_current_limit = 3000000;
+			pdata->input_current_limit =
+					info->data.qc_charger_input_current;
+			pr_info("QC2 set ICHG = 3000mA, AICR = %dmA\n",
+					pdata->input_current_limit / 1000);
 		}
 #ifdef CONFIG_BQ2597X_CHARGE_PUMP
 		charger_manager_set_prop_system_temp_level(info->temp_level);
@@ -343,15 +345,15 @@ static void swchg_select_charging_current_limit(struct charger_manager *info)
 		pdata->charging_current_limit =
 				info->data.check_hv_current;
 	} else if (info->chr_type == HVDCP_CHARGER) {
-		pdata->input_current_limit =
-				info->data.qc_charger_input_current;
-		pdata->charging_current_limit =
-				info->data.ac_charger_current;
+		pdata->input_current_limit = 2500000;
+		pdata->charging_current_limit = 4000000;
+		pr_info("HVDCP set ICHG = 4000mA, AICR = 2500mA\n");
 	}
 #ifdef CONFIG_BQ2597X_CHARGE_PUMP
 	if (swchgalg->state == CHR_XM_QC20) {
-		pdata->input_current_limit = 1500000;
-		pdata->charging_current_limit = 2500000;
+		pdata->input_current_limit =
+				info->data.qc_charger_input_current;
+		pdata->charging_current_limit = 3000000;
 	}
 #endif
 	if (info->enable_sw_jeita) {

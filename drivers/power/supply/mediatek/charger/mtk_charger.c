@@ -1360,9 +1360,58 @@ void charger_manager_set_prop_system_temp_level(int temp_level)
 		return;
 
 	switch (real_type.intval) {
-	case POWER_SUPPLY_TYPE_USB_HVDCP:
-		thermal_icl_ua = pinfo->thermal_mitigation_qc2[pinfo->system_temp_level];
+	case POWER_SUPPLY_TYPE_USB_HVDCP: {
+		static DEFINE_SPINLOCK(hold_lock);
+		static int held_level;
+		static unsigned long last_hold_jiffies;
+		static int gated_level = 9;
+		static bool high_pending;
+		static unsigned long high_since_jiffies;
+		unsigned long flags;
+		int eff_level;
+		int level = pinfo->system_temp_level;
+
+		spin_lock_irqsave(&hold_lock, flags);
+		if (level >= 10) {
+			if (!high_pending) {
+				high_pending = true;
+				high_since_jiffies = jiffies;
+			}
+			if (time_after(jiffies,
+					       high_since_jiffies + 10 * HZ)) {
+				high_pending = false;
+				gated_level = level;
+			}
+		} else {
+			high_pending = false;
+			gated_level = level;
+		}
+		eff_level = gated_level;
+		if (eff_level >= held_level) {
+			held_level = eff_level;
+			last_hold_jiffies = jiffies;
+		} else if (time_after(jiffies,
+				       last_hold_jiffies + 30 * HZ)) {
+			held_level = eff_level;
+			last_hold_jiffies = jiffies;
+		} else {
+			eff_level = held_level;
+		}
+		spin_unlock_irqrestore(&hold_lock, flags);
+
+		thermal_icl_ua = pinfo->thermal_mitigation_qc2[eff_level];
+		if (eff_level <= 7) {
+			if (thermal_icl_ua < 2500000)
+				thermal_icl_ua = 2500000;
+		} else if (eff_level == 8) {
+			if (thermal_icl_ua < 2000000)
+				thermal_icl_ua = 2000000;
+		} else if (eff_level == 9) {
+			if (thermal_icl_ua < 1500000)
+				thermal_icl_ua = 1500000;
+		}
 		break;
+	}
 	case POWER_SUPPLY_TYPE_USB_HVDCP_3P5:
 		thermal_fcc_ua =
 			pinfo->thermal_mitigation_qc3p5[pinfo->system_temp_level];
