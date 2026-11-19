@@ -1334,9 +1334,73 @@ void charger_manager_set_prop_set_temp_num(int vol)
 }
 
 
+static DEFINE_SPINLOCK(qc2_hold_lock);
+static int qc2_held_level;
+static unsigned long qc2_last_hold_jiffies;
+static int qc2_gated_level = 9;
+static bool qc2_high_pending;
+static unsigned long qc2_high_since_jiffies;
+
+static void qc2_thermal_hysteresis_reset(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&qc2_hold_lock, flags);
+	qc2_held_level = 0;
+	qc2_last_hold_jiffies = 0;
+	qc2_gated_level = 9;
+	qc2_high_pending = false;
+	qc2_high_since_jiffies = 0;
+	spin_unlock_irqrestore(&qc2_hold_lock, flags);
+}
+
+static int qc2_thermal_hysteresis_apply(int level)
+{
+	unsigned long flags;
+	unsigned long now;
+	int eff_level;
+
+	spin_lock_irqsave(&qc2_hold_lock, flags);
+	now = jiffies;
+	if (level >= 10) {
+		if (qc2_gated_level >= 10) {
+			qc2_high_pending = false;
+			qc2_gated_level = level;
+		} else {
+			if (!qc2_high_pending) {
+				qc2_high_pending = true;
+				qc2_high_since_jiffies = now;
+			}
+			if (time_after_eq(now,
+					  qc2_high_since_jiffies + 10 * HZ)) {
+				qc2_high_pending = false;
+				qc2_gated_level = level;
+			}
+		}
+	} else {
+		qc2_high_pending = false;
+		qc2_gated_level = level;
+	}
+
+	eff_level = qc2_gated_level;
+	if (eff_level >= qc2_held_level) {
+		qc2_held_level = eff_level;
+		qc2_last_hold_jiffies = now;
+	} else if (time_after_eq(now, qc2_last_hold_jiffies + 30 * HZ)) {
+		qc2_held_level = eff_level;
+		qc2_last_hold_jiffies = now;
+	} else {
+		eff_level = qc2_held_level;
+	}
+	spin_unlock_irqrestore(&qc2_hold_lock, flags);
+
+	return eff_level;
+}
+
 void charger_manager_set_prop_system_temp_level(int temp_level)
 {
 	int thermal_icl_ua = 0, thermal_fcc_ua = 0;
+	int eff_level = 0;
 	int ret = 0;
 	int hvdcp3_type = HVDCP3_NONE;
 	union power_supply_propval val = {0,};
@@ -1356,49 +1420,19 @@ void charger_manager_set_prop_system_temp_level(int temp_level)
 	else
 		pinfo->system_temp_level = temp_level;
 
-	if (!charger_online)
+	if (!charger_online) {
+		qc2_thermal_hysteresis_reset();
 		return;
+	}
+
+	if (real_type.intval != POWER_SUPPLY_TYPE_USB_HVDCP)
+		qc2_thermal_hysteresis_reset();
+
+	eff_level = pinfo->system_temp_level;
 
 	switch (real_type.intval) {
-	case POWER_SUPPLY_TYPE_USB_HVDCP: {
-		static DEFINE_SPINLOCK(hold_lock);
-		static int held_level;
-		static unsigned long last_hold_jiffies;
-		static int gated_level = 9;
-		static bool high_pending;
-		static unsigned long high_since_jiffies;
-		unsigned long flags;
-		int eff_level;
-		int level = pinfo->system_temp_level;
-
-		spin_lock_irqsave(&hold_lock, flags);
-		if (level >= 10) {
-			if (!high_pending) {
-				high_pending = true;
-				high_since_jiffies = jiffies;
-			}
-			if (time_after(jiffies,
-					       high_since_jiffies + 10 * HZ)) {
-				high_pending = false;
-				gated_level = level;
-			}
-		} else {
-			high_pending = false;
-			gated_level = level;
-		}
-		eff_level = gated_level;
-		if (eff_level >= held_level) {
-			held_level = eff_level;
-			last_hold_jiffies = jiffies;
-		} else if (time_after(jiffies,
-				       last_hold_jiffies + 30 * HZ)) {
-			held_level = eff_level;
-			last_hold_jiffies = jiffies;
-		} else {
-			eff_level = held_level;
-		}
-		spin_unlock_irqrestore(&hold_lock, flags);
-
+	case POWER_SUPPLY_TYPE_USB_HVDCP:
+		eff_level = qc2_thermal_hysteresis_apply(pinfo->system_temp_level);
 		thermal_icl_ua = pinfo->thermal_mitigation_qc2[eff_level];
 		if (eff_level <= 7) {
 			if (thermal_icl_ua < 2500000)
@@ -1411,7 +1445,6 @@ void charger_manager_set_prop_system_temp_level(int temp_level)
 				thermal_icl_ua = 1500000;
 		}
 		break;
-	}
 	case POWER_SUPPLY_TYPE_USB_HVDCP_3P5:
 		thermal_fcc_ua =
 			pinfo->thermal_mitigation_qc3p5[pinfo->system_temp_level];
@@ -1437,9 +1470,9 @@ void charger_manager_set_prop_system_temp_level(int temp_level)
 		break;
 	}
 
-	pr_info("%s, system_temp_level:%d thermal_icl_ua:%d thermal_fcc_ua: %d usb_type:%d\n",
-			 __func__, pinfo->system_temp_level, thermal_icl_ua,
-			 thermal_fcc_ua, real_type.intval);
+	pr_info("%s, system_temp_level:%d eff_level:%d thermal_icl_ua:%d thermal_fcc_ua: %d usb_type:%d\n",
+			 __func__, pinfo->system_temp_level, eff_level,
+			 thermal_icl_ua, thermal_fcc_ua, real_type.intval);
 	if (thermal_icl_ua) {
 		ret = charger_manager_set_input_current(thermal_icl_ua);
 		if (ret > 0)
@@ -2527,6 +2560,7 @@ static int mtk_charger_plug_out(struct charger_manager *info)
 	info->chr_type = CHARGER_UNKNOWN;
 	info->charger_thread_polling = false;
 	charger_online = false;
+	qc2_thermal_hysteresis_reset();
 	info->mode_bf = 0;
 
 	pdata1->disable_charging_count = 0;
