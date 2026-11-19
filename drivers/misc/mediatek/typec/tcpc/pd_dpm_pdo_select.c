@@ -61,7 +61,7 @@ void dpm_extract_pdo_info(
 		info->uw = PDO_BATT_EXTRACT_OP_POWER(pdo) * 1000;
 		info->vmin = PDO_BATT_EXTRACT_MIN_VOLT(pdo);
 		info->vmax = PDO_BATT_EXTRACT_MAX_VOLT(pdo);
-		info->ma = info->uw / info->vmin;
+		info->ma = info->vmin ? info->uw / info->vmin : 0;
 		break;
 
 #ifdef CONFIG_USB_PD_REV30_PPS_SINK
