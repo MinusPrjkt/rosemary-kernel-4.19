@@ -105,16 +105,18 @@ extern void set_ln8000_load_flag(bool lnflag);
  * will retry to it. (default count:3) 
  */
 #define I2C_RETRY_CNT   3
-static int ln8000_read_reg(struct ln8000_info *info, u8 addr, void *data)
+static int ln8000_read_reg(struct ln8000_info *info, u8 addr, u8 *data)
 {
     int i, ret = 0;
+    unsigned int val = 0;
 
     mutex_lock(&info->i2c_lock);
     for (i=0; i < I2C_RETRY_CNT; ++i) {
-        ret = regmap_read(info->regmap, addr, data);
+        ret = regmap_read(info->regmap, addr, &val);
         if (IS_ERR_VALUE((unsigned long)ret)) {
             ln_info("failed-read, reg(0x%02X), ret(%d)\n", addr, ret);
         } else {
+            *data = (u8)val;
             break;
         }
     }
@@ -376,9 +378,15 @@ static int ln8000_set_wdt(struct ln8000_info *info, unsigned int cfg)
 /* unplug / reverse-current detection */
 static int ln8000_enable_rcp(struct ln8000_info *info, bool enable)
 {
-    return ln8000_update_reg(info, LN8000_REG_SYS_CTRL, 
-                             BIT(LN8000_BIT_REV_IIN_DET), 
-                             enable << LN8000_BIT_REV_IIN_DET);
+    int ret;
+
+    ret = ln8000_update_reg(info, LN8000_REG_SYS_CTRL,
+                            BIT(LN8000_BIT_REV_IIN_DET),
+                            enable << LN8000_BIT_REV_IIN_DET);
+    if (ret >= 0)
+        info->rcp_en = enable;
+
+    return ret;
 }
 
 /* auto-recovery */
@@ -412,7 +420,8 @@ static bool ln8000_is_sw_init(struct ln8000_info *info)
 /* grab programmed battery float voltage (uV) */
 static int ln8000_get_vbat_float(struct ln8000_info *info)
 {
-    int ret, val;
+    int ret;
+    u8 val;
 
     ret = ln8000_read_reg(info, LN8000_REG_V_FLOAT_CTRL, &val);
     if (ret < 0)
@@ -424,7 +433,8 @@ static int ln8000_get_vbat_float(struct ln8000_info *info)
 /* grab programmed input current limit (uA) */
 static int ln8000_get_iin_limit(struct ln8000_info *info)
 {
-    int ret, val;
+    int ret;
+    u8 val;
     int iin;
 
     ret = ln8000_read_reg(info, LN8000_REG_IIN_CTRL, &val);
@@ -1276,7 +1286,7 @@ static int ln8000_read_int_value(struct ln8000_info *info, u8 *reg_val)
     ln8000_update_reg(info, LN8000_REG_TIMER_CTRL, 0x1, 0x1);
     mdelay(1);
 
-    ret = ln8000_read_reg(info, LN8000_REG_INT1, &reg_val);
+    ret = ln8000_read_reg(info, LN8000_REG_INT1, reg_val);
 
     /* resume INT updates */
     ln8000_update_reg(info, LN8000_REG_TIMER_CTRL, 0x1, 0x0);
