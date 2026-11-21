@@ -339,6 +339,19 @@ static void sched_energy_set(bool has_eas)
 #define EM_MAX_COMPLEXITY 2048
 
 extern struct cpufreq_governor schedutil_gov;
+#ifdef CONFIG_CPU_FREQ_GOV_SCHEDHORIZON
+extern struct cpufreq_governor schedhorizon_gov;
+#endif
+
+static inline bool sched_gov_is_eas_capable(struct cpufreq_governor *gov)
+{
+#ifdef CONFIG_CPU_FREQ_GOV_SCHEDHORIZON
+	if (gov == &schedhorizon_gov)
+		return true;
+#endif
+	return gov == &schedutil_gov;
+}
+
 static bool build_perf_domains(const struct cpumask *cpu_map)
 {
 	int i, nr_pd = 0, nr_cs = 0, nr_cpus = cpumask_weight(cpu_map);
@@ -367,15 +380,15 @@ static bool build_perf_domains(const struct cpumask *cpu_map)
 		if (find_pd(pd, i))
 			continue;
 
-		/* Do not attempt EAS if schedutil is not being used. */
+		/* Do not attempt EAS if neither schedutil nor schedhorizon is used. */
 		policy = cpufreq_cpu_get(i);
 		if (!policy)
 			goto free;
 		gov = policy->governor;
 		cpufreq_cpu_put(policy);
-		if (gov != &schedutil_gov) {
+		if (!sched_gov_is_eas_capable(gov)) {
 			if (rd->pd)
-				pr_warn("rd %*pbl: Disabling EAS, schedutil is mandatory\n",
+				pr_warn("rd %*pbl: Disabling EAS, schedutil or schedhorizon is mandatory\n",
 						cpumask_pr_args(cpu_map));
 			goto free;
 		}

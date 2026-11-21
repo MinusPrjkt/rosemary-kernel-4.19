@@ -1103,14 +1103,27 @@ static void rebuild_sd_workfn(struct work_struct *work)
 }
 static DECLARE_WORK(rebuild_sd_work, rebuild_sd_workfn);
 
+#ifdef CONFIG_CPU_FREQ_GOV_SCHEDHORIZON
+extern struct cpufreq_governor schedhorizon_gov;
+#endif
+
+static inline bool sugov_gov_is_eas(struct cpufreq_governor *gov)
+{
+#ifdef CONFIG_CPU_FREQ_GOV_SCHEDHORIZON
+	if (gov == &schedhorizon_gov)
+		return true;
+#endif
+	return gov == &schedutil_gov;
+}
+
 /*
- * EAS shouldn't be attempted without sugov, so rebuild the sched_domains
- * on governor changes to make sure the scheduler knows about it.
+ * EAS shouldn't be attempted without sugov/schedhorizon, so rebuild the
+ * sched_domains on governor changes to make sure the scheduler knows about it.
  */
 void sched_cpufreq_governor_change(struct cpufreq_policy *policy,
 				  struct cpufreq_governor *old_gov)
 {
-	if (old_gov == &schedutil_gov || policy->governor == &schedutil_gov) {
+	if (sugov_gov_is_eas(old_gov) || sugov_gov_is_eas(policy->governor)) {
 		/*
 		 * When called from the cpufreq_register_driver() path, the
 		 * cpu_hotplug_lock is already held, so use a work item to
