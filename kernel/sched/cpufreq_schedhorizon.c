@@ -117,6 +117,8 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 {
 	struct sugov_tunables *tunables = sg_policy->tunables;
 	unsigned long flags;
+	unsigned int committed;
+	u64 elapsed;
 	int step, max_steps;
 
 	/* Skip locking on the hot path when using the uncapped default table. */
@@ -141,9 +143,19 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 		step = 0;
 	}
 
-	if (step > 0 && *freq <= tunables->efficient_freq[step - 1]) {
-		/* Dropped below lower step ceiling: step down immediately. */
-		step = match_nearest_efficient_step(*freq, max_steps,
+	/*
+	 * Step down only once both the new request and the last committed
+	 * frequency are at or below the lower step's ceiling.  Using the
+	 * request alone would drop the step while the busy-hold or the down
+	 * rate limit keeps the CPU at the higher frequency, so the next
+	 * high-util sample would be capped and forced to dwell again.
+	 * next_freq is serialized by the callers (rq->lock / update_lock).
+	 */
+	committed = sg_policy->next_freq;
+	if (step > 0 && *freq <= tunables->efficient_freq[step - 1] &&
+	    committed <= tunables->efficient_freq[step - 1]) {
+		step = match_nearest_efficient_step(max(*freq, committed),
+						    max_steps,
 						    tunables->efficient_freq);
 		sg_policy->current_step = step;
 		sg_policy->first_hp_request_time = 0;
@@ -164,7 +176,9 @@ static inline void do_freq_limit(struct sugov_policy *sg_policy,
 		goto out;
 	}
 
-	if (time < sg_policy->first_hp_request_time + tunables->up_delay[step]) {
+	elapsed = time > sg_policy->first_hp_request_time ?
+		  time - sg_policy->first_hp_request_time : 0;
+	if (elapsed < tunables->up_delay[step]) {
 		/* Still within dwell time: hold at current step. */
 		*freq = tunables->efficient_freq[step];
 		goto out;
@@ -266,8 +280,22 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 static void sugov_fast_switch(struct sugov_policy *sg_policy, u64 time,
 				  unsigned int next_freq)
 {
-	if (sugov_update_next_freq(sg_policy, time, next_freq))
-		cpufreq_driver_fast_switch(sg_policy->policy, next_freq);
+	struct cpufreq_policy *policy = sg_policy->policy;
+	int cpu;
+
+	if (!sugov_update_next_freq(sg_policy, time, next_freq))
+		return;
+
+	next_freq = cpufreq_driver_fast_switch(policy, next_freq);
+	if (!next_freq)
+		return;
+
+	policy->cur = next_freq;
+
+	if (trace_cpu_frequency_enabled()) {
+		for_each_cpu(cpu, policy->cpus)
+			trace_cpu_frequency(next_freq, cpu);
+	}
 }
 
 static void sugov_deferred_update(struct sugov_policy *sg_policy, u64 time,
@@ -370,9 +398,9 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
  * based on the task model parameters and gives the minimal utilization
  * required to meet deadlines.
  */
-unsigned long schedhorizon_cpu_util(int cpu, unsigned long util_cfs,
-				 unsigned long max, enum schedutil_type type,
-				 struct task_struct *p)
+static unsigned long schedhorizon_cpu_util(int cpu, unsigned long util_cfs,
+					   unsigned long max, enum schedutil_type type,
+					   struct task_struct *p)
 {
 	unsigned long dl_util, util, irq;
 	struct rq *rq = cpu_rq(cpu);
@@ -455,7 +483,6 @@ unsigned long schedhorizon_cpu_util(int cpu, unsigned long util_cfs,
 
 	return min(max, util);
 }
-EXPORT_SYMBOL_GPL(schedhorizon_cpu_util);
 
 static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
 {
@@ -500,6 +527,7 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	unsigned long util, max;
 	unsigned int next_f;
 	unsigned int cached_freq = sg_policy->cached_raw_freq;
+	bool busy;
 
 	sg_cpu->last_update = time;
 
@@ -508,6 +536,9 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	if (!sugov_should_update_freq(sg_policy, time))
 		return;
 
+	/* Limits may have changed, don't skip frequency update */
+	busy = !sg_policy->need_freq_update && sugov_cpu_is_busy(sg_cpu);
+
 	util = sugov_get_util(sg_cpu);
 	max = sg_cpu->max;
 	next_f = get_next_freq(sg_policy, util, max, time);
@@ -515,7 +546,7 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	 * Do not reduce the frequency if the CPU has not been idle
 	 * recently, as the reduction is likely to be premature then.
 	 */
-	if (sugov_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq) {
+	if (busy && next_f < sg_policy->next_freq) {
 		next_f = sg_policy->next_freq;
 
 		/* Restore cached freq as next_freq has changed */
@@ -831,6 +862,7 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 	struct sugov_policy *sg_policy;
 	unsigned long flags;
 	unsigned int *new_efficient_freq, *old;
+	u64 *new_up_delay, *old_up_delay = NULL;
 	int new_num, i;
 
 	new_efficient_freq = resolve_data_freq(buf, &new_num, count);
@@ -850,10 +882,27 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 		}
 	}
 
+	new_up_delay = kcalloc(new_num, sizeof(*new_up_delay), GFP_KERNEL);
+	if (!new_up_delay) {
+		kfree(new_efficient_freq);
+		return -ENOMEM;
+	}
+
 	raw_spin_lock_irqsave(&tunables->change_lock, flags);
 	old = tunables->efficient_freq;
 	WRITE_ONCE(tunables->efficient_freq, new_efficient_freq);
 	tunables->nefficient_freq = new_num;
+	/*
+	 * up_delay is positional per step: if the step count changed, the
+	 * old delays no longer line up, so reset them to zero of the new
+	 * length.  Keeps nefficient_freq == nup_delay after every store.
+	 */
+	if (tunables->nup_delay != new_num) {
+		old_up_delay = tunables->up_delay;
+		tunables->up_delay = new_up_delay;
+		tunables->nup_delay = new_num;
+		new_up_delay = NULL;
+	}
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sg_policy->current_step = 0;
 		sg_policy->first_hp_request_time = 0;
@@ -866,6 +915,9 @@ static ssize_t efficient_freq_store(struct gov_attr_set *attr_set,
 	 */
 	if (old != default_efficient_freq)
 		kfree(old);
+	if (old_up_delay && old_up_delay != default_up_delay)
+		kfree(old_up_delay);
+	kfree(new_up_delay);	/* NULL if consumed */
 
 	return count;
 }
@@ -888,7 +940,9 @@ static ssize_t up_delay_store(struct gov_attr_set *attr_set,
 	/*
 	 * Delays are positional per step, so the array must match the
 	 * number of efficient frequencies.  Write efficient_freq first,
-	 * then up_delay with the same number of entries.
+	 * then up_delay with the same number of entries.  Writing
+	 * efficient_freq with a different number of entries resets
+	 * up_delay to zeros.
 	 */
 	if (new_num != tunables->nefficient_freq) {
 		raw_spin_unlock_irqrestore(&tunables->change_lock, flags);
