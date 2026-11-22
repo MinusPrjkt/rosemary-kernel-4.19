@@ -1937,9 +1937,12 @@ static bool bbr_run_fast_path(struct sock *sk, bool *update_model,
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 prev_min_rtt_us, prev_mode;
 
+	/* 4.19 lacks .skb_marked_lost, so bbr->loss_in_round is not updated
+	 * until bbr_update_congestion_signals(); check rs->losses here.
+	 */
 	if (bbr_param(sk, fast_path) && bbr->try_fast_path &&
 	    rs->is_app_limited && ctx->sample_bw < bbr_max_bw(sk) &&
-	    !bbr->loss_in_round && !bbr->ecn_in_round) {
+	    !rs->losses && !bbr->loss_in_round && !bbr->ecn_in_round) {
 		prev_mode = bbr->mode;
 		prev_min_rtt_us = bbr->min_rtt_us;
 		bbr_check_drain(sk, rs, ctx);
