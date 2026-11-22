@@ -2203,6 +2203,42 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
 			bbr->inflight_lo =
 				max(tp->snd_cwnd, bbr->prior_cwnd);
 		}
+		/* 4.19 has no .skb_marked_lost hook, so tcp_enter_loss()
+		 * marks packets lost without notifying BBR and subsequent
+		 * ACKs see rs->losses == 0. Record the RTO loss here so
+		 * lower/upper bounds still react.
+		 */
+		if (!bbr->loss_in_round)
+			bbr->loss_round_delivered = tp->delivered;
+		bbr->loss_in_round = 1;
+		bbr->loss_in_cycle = 1;
+		if (bbr->bw_probe_samples) {
+			u32 inflight = tcp_packets_in_flight(tp);
+			u32 lost = tp->lost_out;
+			u32 total = inflight + lost;
+			u32 loss_thresh = (u64)total *
+					  bbr_param(sk, loss_thresh) >> BBR_SCALE;
+
+			if (total && lost > loss_thresh) {
+				bbr->prev_probe_too_high = 1;
+				bbr->bw_probe_samples = 0;
+				if (!tp->app_limited) {
+					u32 beta = bbr_param(sk, beta);
+					u32 bdp = bbr_inflight(sk, bbr_bw(sk),
+							       BBR_UNIT);
+					u32 target = min(bdp,
+							 max(tp->snd_cwnd,
+							     bbr->prior_cwnd));
+					u32 hi = (u64)target *
+						 (BBR_UNIT - beta) >> BBR_SCALE;
+
+					bbr->inflight_hi = max(inflight, hi);
+				}
+				if (bbr->mode == BBR_PROBE_BW &&
+				    bbr->cycle_idx == BBR_BW_PROBE_UP)
+					bbr_start_bw_probe_down(sk);
+			}
+		}
 	} else if (bbr->prev_ca_state == TCP_CA_Loss &&
 		   new_state != TCP_CA_Loss) {
 		bbr_exit_loss_recovery(sk);
